@@ -3,7 +3,6 @@ import random
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from typing import List, Tuple
 from detectron2.config import configurable
 from scipy.optimize import linear_sum_assignment
 import fvcore.nn.weight_init as weight_init
@@ -11,7 +10,6 @@ import fvcore.nn.weight_init as weight_init
 from mask2former_video.modeling.transformer_decoder.video_mask2former_transformer_decoder import SelfAttentionLayer,\
     CrossAttentionLayer, FFNLayer, MLP, _get_activation_fn
 from dvis.ClTracker import ReferringCrossAttentionLayer
-from .noiser import Noiser
 
 
 class VideoInstanceSequence(object):
@@ -81,8 +79,6 @@ class VideoInstanceCutter(nn.Module):
         num_reid_head_layers: int = 3,
         match_type: str = 'greedy',
         match_score_thr: float = 0.3,
-
-        warming_layer_num: int = 3,
     ):
         super().__init__()
 
@@ -90,13 +86,11 @@ class VideoInstanceCutter(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = decoder_layer_num
         self.num_classes = num_classes
-        self.num_warming_layers = warming_layer_num
-
         self.transformer_self_attention_layers = nn.ModuleList()
         self.transformer_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
 
-        for _ in range(decoder_layer_num):
+        for _ in range(self.num_layers):
             self.transformer_self_attention_layers.append(
                 SelfAttentionLayer(
                     d_model=hidden_dim,
@@ -129,13 +123,13 @@ class VideoInstanceCutter(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         self.pos_embed = MLP(mask_dim, hidden_dim, hidden_dim, 3)
-        if num_reid_head_layers > 0:
-            self.reid_embed = MLP(
-                hidden_dim, reid_hidden_dim, hidden_dim, num_reid_head_layers)
-            for layer in self.reid_embed.layers:
-                weight_init.c2_xavier_fill(layer)
-        else:
-            self.reid_embed = torch.nn.Identity()  # do nothing
+        # if num_reid_head_layers > 0:
+        #     self.reid_embed = MLP(
+        #         hidden_dim, reid_hidden_dim, hidden_dim, num_reid_head_layers)
+        #     for layer in self.reid_embed.layers:
+        #         weight_init.c2_xavier_fill(layer)
+        # else:
+        #     self.reid_embed = torch.nn.Identity()  # do nothing
 
         # mask features projection
         self.mask_feature_proj = nn.Conv2d(
@@ -159,7 +153,6 @@ class VideoInstanceCutter(nn.Module):
         self.prev_frame_indices = None
         self.tgt_ids_for_track_queries = None
         self.disappear_fq_mask = None
-        self.valid_appear_fq_mask = None
         self.disappear_tgt_id = None
         self.disappear_trcQ_id = None
         self.disappeared_tgt_ids = []
@@ -181,7 +174,6 @@ class VideoInstanceCutter(nn.Module):
         self.prev_frame_indices = None
         self.tgt_ids_for_track_queries = None
         self.disappear_fq_mask = None
-        self.valid_appear_fq_mask = None
         self.disappear_tgt_id = None
         self.disappeared_tgt_ids = []
         self.disappear_trcQ_id = None
@@ -209,35 +201,6 @@ class VideoInstanceCutter(nn.Module):
         else:
             raise NotImplementedError
 
-    def frame_forward(self, track_embeds, single_frame_embeds, disappear_embeds=None,
-                      trcQ_pos=None, detQ_pos=None, valid_fq_mask=None, activate=True):
-        fQ, B, _ = single_frame_embeds.shape
-        num_trcQ = track_embeds.shape[0]
-        new_ins_embeds = self.new_ins_embeds.weight.unsqueeze(1).repeat(self.num_new_ins, B, 1)  # nq, b, c
-
-        output = track_embeds if disappear_embeds is None else torch.cat([track_embeds, new_ins_embeds], dim=0)
-        query_pos = trcQ_pos if disappear_embeds is None else torch.cat([trcQ_pos, detQ_pos], dim=0)
-        key_mem = single_frame_embeds if disappear_embeds is None else torch.cat([single_frame_embeds, disappear_embeds], dim=0)
-        src_pos = detQ_pos if disappear_embeds is None else torch.cat([detQ_pos, track_embeds], dim=0)
-        attn_mask = torch.zeros(size=(B, self.num_heads, output.shape[0], fQ + num_trcQ), dtype=torch.bool).to("cuda")
-        attn_mask[:, :, :num_trcQ, :fQ] = ~valid_fq_mask[None, None, None, :].repeat(B, self.num_heads, num_trcQ, 1)
-        attn_mask[:, :, num_trcQ:, fQ:] = True
-        attn_mask = attn_mask.flatten(0, 1)
-
-        ms_output = [output]
-        for i in range(self.num_layers):
-            output = self.transformer_cross_attention_layers[i](
-                tgt=output, memory=key_mem,
-                query_pos=query_pos, pos=src_pos,
-                memory_mask=attn_mask[..., :fQ] if disappear_embeds is None else attn_mask
-            )
-            output = self.transformer_self_attention_layers[i](output)
-            output = self.transformer_ffn_layers[i](output)
-            ms_output.append(output)
-
-        ms_output = torch.stack(ms_output, dim=0)
-        return ms_output
-
     def forward(self, frame_embeds_no_norm, mask_features, targets, frames_info, matcher, resume=False, using_thr=False):
         ori_mask_features = mask_features
         mask_features_shape = mask_features.shape
@@ -248,8 +211,10 @@ class VideoInstanceCutter(nn.Module):
         assert B == 1
         all_outputs = []
 
+        new_ins_embeds = self.new_ins_embeds.weight.unsqueeze(1).repeat(self.num_new_ins, B, 1)  # nq, b, c
         disappear_embed = self.disappear_embed.weight.unsqueeze(1).repeat(1, B, 1)  # 1, b, c
         for i in range(T):
+            ms_output = []
             single_frame_embeds_no_norm = frame_embeds_no_norm[i]  # q, b, c
             targets_i = targets[i].copy()
             valid_fq_mask = frames_info["valid"][i][0]
@@ -258,11 +223,14 @@ class VideoInstanceCutter(nn.Module):
             # the first frame of a video
             if i == 0 and resume is False:
                 self._clear_memory()
-                ms_output = self.frame_forward(
-                    single_frame_embeds_no_norm, single_frame_embeds_no_norm,
-                    valid_fq_mask=torch.ones_like(valid_fq_mask).to("cuda"),
-                    activate=False,
-                )
+                ms_output.append(single_frame_embeds_no_norm)
+                for j in range(self.num_layers):
+                    output = self.transformer_cross_attention_layers[j](
+                        ms_output[-1], single_frame_embeds_no_norm
+                    )
+                    output = self.transformer_self_attention_layers[j](output)
+                    output = self.transformer_ffn_layers[j](output)
+                    ms_output.append(output)
             else:
                 # modeling disappearance
                 disappear_fq_mask = torch.zeros(size=(fQ,), dtype=torch.bool).to("cuda")
@@ -294,15 +262,45 @@ class VideoInstanceCutter(nn.Module):
                     self.disappear_trcQ_id = None
                 self.disappear_fq_mask = disappear_fq_mask
                 valid_appear_fq_mask = valid_fq_mask & (~disappear_fq_mask)
-                self.valid_appear_fq_mask = valid_appear_fq_mask
 
-                detQ_pos = self.get_mask_pos_embed(frames_info["pred_masks"][i][0][None], ori_mask_features[:, i, ...])
+                detQ_pos = self.get_mask_pos_embed(frames_info["pred_masks"][i][0][None],
+                                                   ori_mask_features[:, i, ...])
+                # pilot = torch.cat([self.track_queries, new_ins_embeds[valid_appear_fq_mask]], dim=0)
+                # pilot_pos = torch.cat([self.track_embeds, detQ_pos[valid_appear_fq_mask]], dim=0)
+                pilot = torch.cat([self.track_queries, new_ins_embeds], dim=0)
+                pilot_pos = torch.cat([self.track_embeds, detQ_pos], dim=0)
                 disappear_embeds = disappear_embed.repeat(self.track_queries.shape[0], 1, 1)
-                ms_output = self.frame_forward(
-                    self.track_queries, single_frame_embeds_no_norm, disappear_embeds=disappear_embeds,
-                    trcQ_pos=self.track_embeds, detQ_pos=detQ_pos, valid_fq_mask=valid_appear_fq_mask, activate=True
-                )
+                attn_mask = torch.zeros(size=(B, self.num_heads, pilot.shape[0], fQ+self.track_queries.shape[0]),
+                                        dtype=torch.bool).to("cuda")
+                attn_mask[:, :, :self.track_queries.shape[0], :fQ] = ~valid_appear_fq_mask[None, None, None, :].repeat(B, self.num_heads, self.track_queries.shape[0], 1)
+                attn_mask[:, :, self.track_queries.shape[0]:, fQ:] = True
+                attn_mask = attn_mask.flatten(0, 1)
+                # disappear_embeds = disappear_embed.repeat(self.track_queries.shape[0], 1, 1) + self.track_embeds
+                # # disappear_embeds = disappear_embed.repeat(self.track_queries.shape[0], 1, 1)
+                # disappear_embeds = self.disappear_norm(disappear_embeds)
+                # disappear_embeds = self.disappear_ffn(disappear_embeds)
+                # self.cur_disappear_embeds = disappear_embeds
+                ms_output.append(pilot)
+                for j in range(self.num_layers):
+                    # output = self.transformer_cross_attention_layers[j](
+                    #     ms_output[-1], torch.cat([single_frame_embeds_no_norm[~disappear_fq_mask],
+                    #                               disappear_embeds], dim=0),
+                    #     query_pos=pilot_pos,
+                    #     # pos=torch.cat([detQ_pos[~disappear_fq_mask], self.track_embeds], dim=0),
+                    # )
+                    output = self.transformer_cross_attention_layers[j](
+                        ms_output[-1], torch.cat([single_frame_embeds_no_norm,
+                                                  disappear_embeds], dim=0),
+                        query_pos=pilot_pos,
+                        pos=torch.cat([detQ_pos,
+                                       self.track_queries], dim=0),
+                        memory_mask=attn_mask
+                    )
+                    output = self.transformer_self_attention_layers[j](output)
+                    output = self.transformer_ffn_layers[j](output)
+                    ms_output.append(output)
 
+            ms_output = torch.stack(ms_output, dim=0)  # (num_layers+1, q, b, c)
             outputs_class, outputs_mask = self.prediction(ms_output, mask_features[:, i, ...])
             out_dict = {
                 "pred_logits": outputs_class[-1],  # b, q, k+1
@@ -315,7 +313,17 @@ class VideoInstanceCutter(nn.Module):
                     "indices": frames_info["indices"][i]  # [(src_idx, tgt_idx)], only valid inst
                 })
 
+                # tgt_ids_for_all_fq = torch.full(size=(fQ,), dtype=torch.int64, fill_value=-1).to("cuda")
+                # tgt_ids_for_all_fq[frames_info["indices"][i][0][0]] = frames_info["indices"][i][0][1]
+                # src_indices = torch.nonzero(tgt_ids_for_all_fq[valid_fq_mask] + 1).squeeze(-1)
+                # tgt_indices = torch.index_select(tgt_ids_for_all_fq[valid_fq_mask], dim=0, index=src_indices)
+                # out_dict.update({
+                #     # "indices": frames_info["indices"][i]  # [(src_idx, tgt_idx)], only valid inst
+                #     "indices": [(src_indices, tgt_indices)]
+                # })
+
                 if using_thr:
+                    # tgt_ids_for_each_query = tgt_ids_for_all_fq[valid_fq_mask]
                     tgt_ids_for_each_query = torch.full(size=(ms_output.shape[1],), dtype=torch.int64,
                                                         fill_value=-1).to("cuda")
                     tgt_ids_for_each_query[frames_info["indices"][i][0][0]] = frames_info["indices"][i][0][1]
@@ -328,9 +336,13 @@ class VideoInstanceCutter(nn.Module):
                     select_track_queries = torch.rand(size=(len(frames_info["indices"][i][0][0]),),
                                                       dtype=torch.float32).to("cuda") > 0.5
                     kick_out_src_indices = frames_info["indices"][i][0][0][select_track_queries]
+                    # tgt_ids_for_all_fq[kick_out_src_indices] = -1
                     tgt_ids_for_each_query[kick_out_src_indices] = -1
+                    # tgt_ids_for_each_query = tgt_ids_for_all_fq[valid_fq_mask]
                     disappearance_mask = torch.zeros(size=(ms_output.shape[1],), dtype=torch.bool).to("cuda")
+                    # disappearance_mask = torch.zeros(size=(fQ,), dtype=torch.bool).to("cuda")
                     disappearance_mask[kick_out_src_indices] = True
+                    # valid_track_query = ~disappearance_mask[valid_fq_mask]
                     valid_track_query = ~disappearance_mask
             else:
                 indices = matcher(out_dict, targets_i, self.prev_frame_indices)
@@ -351,114 +363,113 @@ class VideoInstanceCutter(nn.Module):
                     valid_track_query = torch.ones(size=(ms_output.shape[1],)).to("cuda") < 0
                     valid_track_query[indices[0][0]] = True
 
-            if not using_thr:
-                # if self.disappear_trcQ_id is not None:
-                #     valid_track_query[self.disappear_trcQ_id] = False  # as this query was used as disappearance modeling
-                self.track_queries = ms_output[-1][valid_track_query]  # q', b, c
-                select_query_tgt_ids = tgt_ids_for_each_query[valid_track_query]  # q',
-                prev_src_indices = torch.nonzero(select_query_tgt_ids + 1).squeeze(-1)
-                prev_tgt_indices = torch.index_select(select_query_tgt_ids, dim=0, index=prev_src_indices)
-                self.prev_frame_indices = (prev_src_indices, prev_tgt_indices)
-                self.tgt_ids_for_track_queries = tgt_ids_for_each_query[valid_track_query]
+            # if not using_thr:
+            #     # if self.disappear_trcQ_id is not None:
+            #     #     valid_track_query[self.disappear_trcQ_id] = False  # as this query was used as disappearance modeling
+            #     select_query_tgt_ids = tgt_ids_for_each_query[valid_track_query]  # q',
+            #
+            #     self.track_queries = ms_output[-1][valid_track_query]  # q', b, c
+            #     prev_src_indices = torch.nonzero(select_query_tgt_ids + 1).squeeze(-1)
+            #     prev_tgt_indices = torch.index_select(select_query_tgt_ids, dim=0, index=prev_src_indices)
+            #     self.prev_frame_indices = (prev_src_indices, prev_tgt_indices)
+            #
+            #     self.track_embeds = self.get_mask_pos_embed(outputs_mask[-1, :, valid_track_query, :, :],
+            #                                                 ori_mask_features[:, i, ...])  # q', b, c
+            #     out_dict.update({
+            #         "aux_outputs": self._set_aux_loss(outputs_class, outputs_mask),
+            #         "disappear_tgt_id": -10000 if self.disappear_tgt_id is None else self.disappear_tgt_id
+            #     })
+            #     all_outputs.append(out_dict)
+            #     continue
 
-                self.track_embeds = self.get_mask_pos_embed(outputs_mask[-1, :, valid_track_query, :, :],
-                                                            ori_mask_features[:, i, ...])  # q', b, c
-
-                out_dict.update({
-                    "aux_outputs": self._set_aux_loss(outputs_class, outputs_mask),
-                    "disappear_tgt_id": -10000 if self.disappear_tgt_id is None else self.disappear_tgt_id,
-                })
-                all_outputs.append(out_dict)
-                continue
-
-            # CL loss part
-            reid_out_list = []
-            use_disappear_embed_count = 0
-            if i == 0 and resume is False:
-                reid_embeds = self.reid_embed(ms_output[-1])  # q'+nq, b, c
-            else:
-                frame_tgt2src_indices = {tgt.item(): src.item() for src, tgt in zip(frames_info["indices"][i][0][0],
-                                                                                    frames_info["indices"][i][0][1])}
-                aux_tgt_i_for_each_fq = frames_info["aux_indices"][i][0][1]
-                reid_embeds = self.reid_embed(ms_output[-1])  # q'+nq, b, c
-                src_reid_embeds = self.reid_embed(
-                    torch.cat([single_frame_embeds_no_norm, disappear_embed], dim=0))  # fQ+1, B, C
-                disappear_ks = [k for k in range(self.track_queries.shape[0]) if tgt_ids_for_each_query[k] == -1 or
-                                ~targets_i[0]["valid_inst"][tgt_ids_for_each_query[k]]]
-                for k in range(reid_embeds.shape[0]):
-                    if k >= self.track_queries.shape[0]:
-                        break
-                    if tgt_ids_for_each_query[k] != -1 and targets_i[0]["valid_inst"][tgt_ids_for_each_query[k]]:
-                        if self.disappear_tgt_id is not None and tgt_ids_for_each_query[k] == self.disappear_tgt_id:
-                            # modeling disappearance
-                            assert k == self.disappear_trcQ_id
-                            anchor_embedding = reid_embeds[k, 0, :]
-                            src_k = -1  # fQ + K
-                            positive_embedding = src_reid_embeds[src_k, 0, :]
-                            negative_query_id_1 = sorted(list(set(range(reid_embeds.shape[0])) - set([k]+disappear_ks)))
-                            negative_embedding = torch.cat([reid_embeds[negative_query_id_1, 0, :],
-                                                            src_reid_embeds[:fQ][self.valid_appear_fq_mask, 0, :]], dim=0)
-                            reid_out = {
-                                "anchor_embedding": anchor_embedding,
-                                "positive_embedding": positive_embedding,
-                                "negative_embedding": negative_embedding
-                            }
-                            reid_out_list.append(reid_out)
-                            bio_reid_out = {
-                                "anchor_embedding": positive_embedding,
-                                "positive_embedding": anchor_embedding,
-                                "negative_embedding": negative_embedding
-                            }
-                            reid_out_list.append(bio_reid_out)
-                            use_disappear_embed_count += 1
-                        else:
-                            # print("True Positive \ False Negative")
-                            anchor_embedding = reid_embeds[k, 0, :]
-                            src_k = frame_tgt2src_indices[tgt_ids_for_each_query[k].item()]
-                            assert self.valid_appear_fq_mask[src_k]
-                            positive_embedding = src_reid_embeds[src_k, 0, :]
-                            negative_query_id_1 = sorted(list(set(range(reid_embeds.shape[0])) - set([k])))
-
-                            valid_appear_fq_tgt_ids = aux_tgt_i_for_each_fq[self.valid_appear_fq_mask]
-                            _neg_fq_ids = torch.arange(0, fQ).to("cuda")[self.valid_appear_fq_mask][valid_appear_fq_tgt_ids != tgt_ids_for_each_query[k]]
-                            negative_query_id_2 = sorted(list(set(_neg_fq_ids.cpu().numpy().tolist()) - set([src_k])) + [fQ])
-                            negative_embedding = torch.cat([reid_embeds[negative_query_id_1, 0, :],
-                                                            src_reid_embeds[negative_query_id_2, 0, :]], dim=0)
-                            reid_out = {
-                                "anchor_embedding": anchor_embedding,
-                                "positive_embedding": positive_embedding,
-                                "negative_embedding": negative_embedding
-                            }
-                            reid_out_list.append(reid_out)
-                            bio_reid_out = {
-                                "anchor_embedding": positive_embedding,
-                                "positive_embedding": anchor_embedding,
-                                "negative_embedding": negative_embedding
-                            }
-                            reid_out_list.append(bio_reid_out)
-                            use_disappear_embed_count += 1
-                    elif k < self.track_queries.shape[0]:
-                        # print("True Negative \ False Positive")
-                        anchor_embedding = reid_embeds[k, 0, :]
-                        src_k = -1  # fQ + k
-                        positive_embedding = src_reid_embeds[src_k, 0, :]
-                        _disappear_trcQ_id = k if self.disappear_trcQ_id is None else self.disappear_trcQ_id
-                        negative_query_id_1 = sorted(list(set(range(reid_embeds.shape[0])) - set([k, _disappear_trcQ_id] + disappear_ks)))
-                        negative_embedding = torch.cat([reid_embeds[negative_query_id_1, 0, :],
-                                                        src_reid_embeds[:fQ][self.valid_appear_fq_mask, 0, :]], dim=0)
-                        reid_out = {
-                            "anchor_embedding": anchor_embedding,
-                            "positive_embedding": positive_embedding,
-                            "negative_embedding": negative_embedding
-                        }
-                        reid_out_list.append(reid_out)
-                        bio_reid_out = {
-                            "anchor_embedding": positive_embedding,
-                            "positive_embedding": anchor_embedding,
-                            "negative_embedding": negative_embedding
-                        }
-                        reid_out_list.append(bio_reid_out)
-                        use_disappear_embed_count += 1
+            # # CL loss part
+            # reid_out_list = []
+            # use_disappear_embed_count = 0
+            # if i == 0 and resume is False:
+            #     reid_embeds = self.reid_embed(ms_output[-1])  # q'+nq, b, c
+            # else:
+            #     frame_tgt2src_indices = {tgt.item(): src.item() for src, tgt in zip(frames_info["indices"][i][0][0],
+            #                                                                         frames_info["indices"][i][0][1])}
+            #     reid_embeds = self.reid_embed(ms_output[-1])  # q'+nq, b, c
+            #     src_reid_embeds = self.reid_embed(
+            #         torch.cat([single_frame_embeds_no_norm, self.cur_disappear_embeds], dim=0))
+            #     for k in range(reid_embeds.shape[0]):
+            #         if k >= self.track_queries.shape[0]:
+            #             break
+            #         if tgt_ids_for_each_query[k] != -1 and targets_i[0]["valid_inst"][tgt_ids_for_each_query[k]]:
+            #             if self.disappear_tgt_id is not None and tgt_ids_for_each_query[k] == self.disappear_tgt_id:
+            #                 # modeling disappearance
+            #                 assert k == self.disappear_trcQ_id
+            #                 anchor_embedding = reid_embeds[k, 0, :]
+            #                 src_k = fQ + k
+            #                 positive_embedding = src_reid_embeds[src_k, 0, :]
+            #                 negative_query_id_1 = sorted(
+            #                     random.sample(set(range(reid_embeds.shape[0])) - set([k]),
+            #                                   reid_embeds.shape[0] - 1))
+            #                 negative_embedding = torch.cat([reid_embeds[negative_query_id_1, 0, :],
+            #                                                 src_reid_embeds[:fQ][~self.disappear_fq_mask, 0, :]], dim=0)
+            #                 reid_out = {
+            #                     "anchor_embedding": anchor_embedding,
+            #                     "positive_embedding": positive_embedding,
+            #                     "negative_embedding": negative_embedding
+            #                 }
+            #                 reid_out_list.append(reid_out)
+            #                 bio_reid_out = {
+            #                     "anchor_embedding": positive_embedding,
+            #                     "positive_embedding": anchor_embedding,
+            #                     "negative_embedding": negative_embedding
+            #                 }
+            #                 reid_out_list.append(bio_reid_out)
+            #                 use_disappear_embed_count += 1
+            #             else:
+            #                 # print("True Positive \ False Negative")
+            #                 anchor_embedding = reid_embeds[k, 0, :]
+            #                 src_k = frame_tgt2src_indices[tgt_ids_for_each_query[k].item()]
+            #                 assert not self.disappear_fq_mask[src_k]
+            #                 positive_embedding = src_reid_embeds[src_k, 0, :]
+            #                 negative_query_id_1 = sorted(
+            #                     random.sample(set(range(reid_embeds.shape[0])) - set([k]), reid_embeds.shape[0] - 1))
+            #                 negative_query_id_2 = sorted(
+            #                     random.sample(set(range(src_reid_embeds.shape[0])) - set([src_k]),
+            #                                   src_reid_embeds.shape[0] - 1))
+            #                 negative_embedding = torch.cat([reid_embeds[negative_query_id_1, 0, :],
+            #                                                 src_reid_embeds[negative_query_id_2, 0, :]], dim=0)
+            #                 reid_out = {
+            #                     "anchor_embedding": anchor_embedding,
+            #                     "positive_embedding": positive_embedding,
+            #                     "negative_embedding": negative_embedding
+            #                 }
+            #                 reid_out_list.append(reid_out)
+            #                 bio_reid_out = {
+            #                     "anchor_embedding": positive_embedding,
+            #                     "positive_embedding": anchor_embedding,
+            #                     "negative_embedding": negative_embedding
+            #                 }
+            #                 reid_out_list.append(bio_reid_out)
+            #                 use_disappear_embed_count += 1
+            #         elif k < self.track_queries.shape[0]:
+            #             # print("True Negative \ False Positive")
+            #             anchor_embedding = reid_embeds[k, 0, :]
+            #             src_k = fQ + k
+            #             positive_embedding = src_reid_embeds[src_k, 0, :]
+            #             negative_query_id_1 = sorted(
+            #                 random.sample(set(range(reid_embeds.shape[0])) - set([k]),
+            #                               reid_embeds.shape[0] - 1))
+            #             negative_embedding = torch.cat([reid_embeds[negative_query_id_1, 0, :],
+            #                                             src_reid_embeds[:, 0, :]], dim=0)
+            #             reid_out = {
+            #                 "anchor_embedding": anchor_embedding,
+            #                 "positive_embedding": positive_embedding,
+            #                 "negative_embedding": negative_embedding
+            #             }
+            #             reid_out_list.append(reid_out)
+            #             bio_reid_out = {
+            #                 "anchor_embedding": positive_embedding,
+            #                 "positive_embedding": anchor_embedding,
+            #                 "negative_embedding": negative_embedding
+            #             }
+            #             reid_out_list.append(bio_reid_out)
+            #             use_disappear_embed_count += 1
 
             # if self.disappear_trcQ_id is not None:
             #     valid_track_query[self.disappear_trcQ_id] = False  # as this query was used as disappearance modeling
@@ -480,11 +491,11 @@ class VideoInstanceCutter(nn.Module):
             out_dict.update({
                 "aux_outputs": self._set_aux_loss(outputs_class, outputs_mask),
                 # "disappear_logits": disappear_logits,
-                "disappear_embeds": self.disappear_embed.weight,
-                "reid_outputs": reid_out_list,
-                "reid_embeds": reid_embeds,
-                "use_disappear_embed_count": use_disappear_embed_count,
-                "disappear_tgt_id": -10000 if self.disappear_tgt_id is None else self.disappear_tgt_id,
+                # "disappear_embeds": self.disappear_embed.weight,
+                # "reid_outputs": reid_out_list,
+                # "reid_embeds": reid_embeds,
+                # "use_disappear_embed_count": use_disappear_embed_count,
+                "disappear_tgt_id": -10000 if self.disappear_tgt_id is None else self.disappear_tgt_id
             })
             all_outputs.append(out_dict)
 
@@ -500,8 +511,10 @@ class VideoInstanceCutter(nn.Module):
         T, fQ, B, _ = frame_embeds_no_norm.shape
         assert B == 1
 
+        new_ins_embeds = self.new_ins_embeds.weight.unsqueeze(1).repeat(self.num_new_ins, B, 1)  # nq, b, c
         disappear_embed = self.disappear_embed.weight.unsqueeze(1).repeat(1, B, 1)  # 1, b, c
         for i in range(T):
+            ms_output = []
             single_frame_embeds_no_norm = frame_embeds_no_norm[i]  # q, b, c
             valid_fq_mask = frames_info["valid"][i][0]
             num_valid_fq = valid_fq_mask.sum()
@@ -509,19 +522,51 @@ class VideoInstanceCutter(nn.Module):
             # the first frame of a video
             if i == 0 and resume is False:
                 self._clear_memory()
-                ms_output = self.frame_forward(
-                    single_frame_embeds_no_norm, single_frame_embeds_no_norm,
-                    valid_fq_mask=torch.ones_like(valid_fq_mask).to("cuda"),
-                    activate=False,
-                )
+                ms_output.append(single_frame_embeds_no_norm)
+                for j in range(self.num_layers):
+                    output = self.transformer_cross_attention_layers[j](
+                        ms_output[-1], single_frame_embeds_no_norm
+                    )
+                    output = self.transformer_self_attention_layers[j](output)
+                    output = self.transformer_ffn_layers[j](output)
+                    ms_output.append(output)
             else:
-                detQ_pos = self.get_mask_pos_embed(frames_info["pred_masks"][i][0][None], ori_mask_features[:, i, ...])
+                detQ_pos = self.get_mask_pos_embed(frames_info["pred_masks"][i][0][None],
+                                                   ori_mask_features[:, i, ...])
+                # pilot = torch.cat([self.track_queries, new_ins_embeds[valid_fq_mask]], dim=0)
+                # pilot_pos = torch.cat([self.track_embeds, detQ_pos[valid_fq_mask]], dim=0)
+                pilot = torch.cat([self.track_queries, new_ins_embeds], dim=0)
+                pilot_pos = torch.cat([self.track_embeds, detQ_pos], dim=0)
                 disappear_embeds = disappear_embed.repeat(self.track_queries.shape[0], 1, 1)
-                ms_output = self.frame_forward(
-                    self.track_queries, single_frame_embeds_no_norm, disappear_embeds=disappear_embeds,
-                    trcQ_pos=self.track_embeds, detQ_pos=detQ_pos, valid_fq_mask=valid_fq_mask, activate=False
-                )
+                attn_mask = torch.zeros(size=(B, self.num_heads, pilot.shape[0], fQ + self.track_queries.shape[0]),
+                                        dtype=torch.bool).to("cuda")
+                attn_mask[:, :, :self.track_queries.shape[0], :fQ] = ~valid_fq_mask[None, None, None, :].repeat(B, self.num_heads, self.track_queries.shape[0], 1)
+                attn_mask[:, :, self.track_queries.shape[0]:, fQ:] = True
+                attn_mask = attn_mask.flatten(0, 1)
 
+                # disappear_embeds = disappear_embed.repeat(self.track_queries.shape[0], 1, 1) + self.track_embeds
+                # disappear_embeds = self.disappear_norm(disappear_embeds)
+                # disappear_embeds = self.disappear_ffn(disappear_embeds)
+                # self.cur_disappear_embeds = disappear_embeds
+                ms_output.append(pilot)
+                for j in range(self.num_layers):
+                    # output = self.transformer_cross_attention_layers[j](
+                    #     ms_output[-1], torch.cat([single_frame_embeds_no_norm, disappear_embeds], dim=0),
+                    #     query_pos=pilot_pos,
+                    # )
+                    output = self.transformer_cross_attention_layers[j](
+                        ms_output[-1], torch.cat([single_frame_embeds_no_norm,
+                                                  disappear_embeds], dim=0),
+                        query_pos=pilot_pos,
+                        pos=torch.cat([detQ_pos,
+                                       self.track_queries], dim=0),
+                        memory_mask=attn_mask
+                    )
+                    output = self.transformer_self_attention_layers[j](output)
+                    output = self.transformer_ffn_layers[j](output)
+                    ms_output.append(output)
+
+            ms_output = torch.stack(ms_output, dim=0)  # (num_layers+1, q, b, c)
             outputs_class, outputs_mask = self.prediction(ms_output, mask_features[:, i, ...])
 
             cur_seq_ids = []
@@ -604,3 +649,4 @@ class VideoInstanceCutter(nn.Module):
                  "disappear_tgt_id": -10000 if self.disappear_tgt_id is None else self.disappear_tgt_id,
                  } for a, b
                 in zip(outputs_cls[:-1], outputs_mask[:-1])]
+
