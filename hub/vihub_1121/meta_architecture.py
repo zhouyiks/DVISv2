@@ -438,6 +438,7 @@ class ViHub_online(MinVIS):
                 del out['aux_outputs'][j]['pred_masks'], out['aux_outputs'][j]['pred_logits']
             # referring tracker inference
             frame_embds_no_norm = out['pred_embds']  # (b, c, t, q)
+            frame_reid_embeds = out["pred_reid_embed"]
             mask_features = out['mask_features'].unsqueeze(0) # as B == 1
             pred_logits, pred_masks = out["pred_logits"].flatten(0, 1), out["pred_masks"].transpose(1, 2).flatten(0, 1)
 
@@ -477,9 +478,9 @@ class ViHub_online(MinVIS):
             frame_info = {"pred_logits": new_pred_logits, "pred_masks": new_pred_masks, "valid": new_valid_masks}
 
             if i != 0 or self.keep:
-                self.tracker.inference(frame_embds_no_norm, mask_features, frame_info, video_start_idx+start_idx, resume=True, to_store=to_store)
+                self.tracker.inference(frame_embds_no_norm, frame_reid_embeds, mask_features, frame_info, video_start_idx+start_idx, resume=True, to_store=to_store)
             else:
-                self.tracker.inference(frame_embds_no_norm, mask_features, frame_info, video_start_idx+start_idx, to_store=to_store)
+                self.tracker.inference(frame_embds_no_norm, frame_reid_embeds, mask_features, frame_info, video_start_idx+start_idx, to_store=to_store)
 
         logits_list = []
         masks_list = []
